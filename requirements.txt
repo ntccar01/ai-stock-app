@@ -6,3 +6,4 @@ plotly
 twstock
 feedparser
 scikit-learn
+lxml
