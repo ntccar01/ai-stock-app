@@ -9,10 +9,10 @@ import feedparser
 import urllib.parse
 from datetime import datetime, timedelta
 from sklearn.ensemble import RandomForestRegressor
-import io
+import requests
 
 # --- 1. 網頁設定 ---
-st.set_page_config(page_title="AI 股市操盤手 V6.1 Fix", layout="wide")
+st.set_page_config(page_title="AI 股市操盤手 V6.2 Debug", layout="wide")
 
 st.markdown("""
 <style>
@@ -21,11 +21,11 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 2. 核心函式 ---
+# --- 2. 核心函式 (強化版) ---
 
 @st.cache_data(ttl=3600)
 def get_stock_info(code, search_code):
-    # 預設值，避免當機
+    # 初始化預設資料
     data = {
         "name": code,
         "pe": "N/A",
@@ -36,16 +36,25 @@ def get_stock_info(code, search_code):
     }
     
     try:
-        # 嘗試抓取中文名稱
+        # 1. 嘗試抓取中文名稱
         try:
-            data["name"] = twstock.codes[code].name
+            # 這裡加個保護，以免 twstock 連線失敗影響主程式
+            if code.isdigit():
+                stock_info = twstock.codes.get(code)
+                if stock_info:
+                    data["name"] = stock_info.name
         except:
-            data["name"] = code
+            pass
 
+        # 2. 抓取 Yahoo 基本面
         stock = yf.Ticker(search_code)
         info = stock.info
         
-        # 抓取財報
+        # 如果 info 是空的，手動拋出錯誤讓我們知道
+        if not info or len(info) < 5:
+            print(f"Yahoo Info 抓取失敗: {search_code}")
+        
+        # 3. 抓取財報 (容錯處理)
         try:
             financials = stock.financials
             if not financials.empty:
@@ -58,14 +67,14 @@ def get_stock_info(code, search_code):
                     "earnings": earnings[::-1] if len(earnings)>0 else []
                 }
         except:
-            pass # 財報抓不到就算了，不要當機
+            pass 
 
-        # 抓取基本面
-        dividend_rate = info.get('dividendRate', 0) 
-        current_price = info.get('currentPrice') or info.get('previousClose')
+        # 4. 填入數據
+        div_rate = info.get('dividendRate', 0) 
+        price = info.get('currentPrice') or info.get('previousClose') or info.get('regularMarketPrice')
         
-        if dividend_rate and current_price:
-            data["yield"] = dividend_rate / current_price
+        if div_rate and price:
+            data["yield"] = div_rate / price
         else:
             data["yield"] = info.get('dividendYield', 0)
 
@@ -76,27 +85,53 @@ def get_stock_info(code, search_code):
         return data
 
     except Exception as e:
-        print(f"Error fetching info: {e}")
-        return None
+        print(f"Info Error: {e}")
+        return data # 發生錯誤時回傳部分資料，不要回傳 None
 
 @st.cache_data(ttl=3600)
 def get_data(ticker_symbol, start):
     try:
-        df = yf.download(ticker_symbol, start=start, progress=False)
-        if df.empty: return None
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        # 技巧：偽裝成瀏覽器 User-Agent
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
+
+        # 方法 A: 直接下載
+        df = yf.download(ticker_symbol, start=start, progress=False, session=session)
         
+        # 方法 B: 如果 A 失敗 (空資料)，改用 Ticker.history
+        if df.empty:
+            print("Download method failed, trying History method...")
+            ticker = yf.Ticker(ticker_symbol, session=session)
+            df = ticker.history(start=start)
+        
+        # 如果還是空的，宣告失敗
+        if df.empty: 
+            return None
+
+        # 資料清理：處理多層索引 (MultiIndex) 問題
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+            
+        # 確保有 Close 欄位
+        if 'Close' not in df.columns:
+            return None
+
+        # 計算指標
         df['SMA_5'] = ta.sma(df['Close'], length=5)
         df['SMA_20'] = ta.sma(df['Close'], length=20)
         df['SMA_60'] = ta.sma(df['Close'], length=60)
         df['RSI'] = ta.rsi(df['Close'], length=14)
         df['Momentum'] = df['Close'] - df['Close'].shift(5)
-        df['Volatility'] = df['Close'].rolling(5).std()
+        df = df.dropna()
         
-        return df.dropna()
-    except:
+        return df
+    except Exception as e:
+        print(f"Data Error: {e}")
         return None
 
+# 抓大盤 (簡化版)
 @st.cache_data(ttl=3600)
 def get_market_data(start):
     try:
@@ -123,9 +158,7 @@ def train_and_predict(df):
         data = df_ml.dropna()
         X = data[features]
         y = data['Target']
-        
-        if len(X) < 10: return 0, 0 # 資料太少不預測
-
+        if len(X) < 10: return 0, 0
         split = int(len(X) * 0.9)
         model = RandomForestRegressor(n_estimators=100, random_state=42)
         model.fit(X.iloc[:split], y.iloc[:split])
@@ -145,42 +178,54 @@ if time_range == "6個月": start_date = end_date - timedelta(days=180)
 elif time_range == "1年": start_date = end_date - timedelta(days=365)
 else: start_date = end_date - timedelta(days=1095)
 
+# 代號處理
 if not ticker_input.endswith(".TW") and not ticker_input.endswith(".TWO"):
     ticker_search = ticker_input + ".TW"
 else:
     ticker_search = ticker_input
-    ticker_input = ticker_input.split('.')[0]
+    ticker_input = ticker_input.split('.')[0] # 顯示用代號
 
-# 抓取資料
+# 執行抓取
 info = get_stock_info(ticker_input, ticker_search)
 df = get_data(ticker_search, start_date)
 market_df = get_market_data(start_date)
 
 tab1, tab2, tab3 = st.tabs(["📊 綜合分析與績效", "🧠 AI 預測模型", "🎯 智慧選股掃描"])
 
-# --- TAB 1 ---
+# --- TAB 1 顯示邏輯 ---
 with tab1:
-    if df is not None and info is not None:
+    # 檢查點 1: 資料是否抓取成功
+    if df is None:
+        st.error(f"❌ 無法讀取股價資料 (Symbol: {ticker_search})。可能原因：1. Yahoo 暫時阻擋連線 2. 代號輸入錯誤。")
+        st.info("💡 建議嘗試：重新整理網頁，或輸入其他代號 (例如 2317) 測試。")
+    elif info is None:
+        st.error("❌ 無法讀取基本面資料，但股價讀取成功。")
+    else:
+        # 資料完整，開始顯示
         st.subheader(f"📈 {info['name']} ({ticker_input}) 深度分析")
         
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("本益比", f"{info['pe']:.1f}" if info['pe'] != 'N/A' else "N/A")
-        c2.metric("殖利率", f"{info['yield']*100:.2f}%" if info['yield'] else "N/A")
-        c3.metric("EPS", f"{info['eps']:.2f}" if info['eps'] != 'N/A' else "N/A")
-        c4.metric("Beta", f"{info['beta']:.2f}" if info['beta'] != 'N/A' else "N/A")
+        c1.metric("本益比", f"{info['pe']:.1f}" if info['pe'] != 'N/A' else "-")
+        c2.metric("殖利率", f"{info['yield']*100:.2f}%" if info['yield'] else "-")
+        c3.metric("EPS", f"{info['eps']:.2f}" if info['eps'] != 'N/A' else "-")
+        c4.metric("Beta", f"{info['beta']:.2f}" if info['beta'] != 'N/A' else "-")
         
-        # 績效比較圖
-        st.markdown("### 🆚 績效對決：個股 vs 大盤")
-        stock_norm = (df['Close'] / df['Close'].iloc[0] - 1) * 100
-        if market_df is not None:
-            market_aligned = market_df.reindex(df.index, method='ffill')
-            market_norm = (market_aligned / market_aligned.iloc[0] - 1) * 100
-            
+        # 績效圖
+        st.markdown("### 🆚 績效對決")
+        try:
+            stock_norm = (df['Close'] / df['Close'].iloc[0] - 1) * 100
             fig_compare = go.Figure()
             fig_compare.add_trace(go.Scatter(x=df.index, y=stock_norm, mode='lines', name=info['name'], line=dict(color='red')))
-            fig_compare.add_trace(go.Scatter(x=df.index, y=market_norm, mode='lines', name='大盤', line=dict(color='gray', dash='dash')))
+            
+            if market_df is not None:
+                market_aligned = market_df.reindex(df.index, method='ffill')
+                market_norm = (market_aligned / market_aligned.iloc[0] - 1) * 100
+                fig_compare.add_trace(go.Scatter(x=df.index, y=market_norm, mode='lines', name='大盤', line=dict(color='gray', dash='dash')))
+            
             fig_compare.update_layout(height=350, margin=dict(l=0,r=0,t=30,b=0))
             st.plotly_chart(fig_compare, use_container_width=True)
+        except Exception as e:
+            st.write("績效圖表繪製失敗，資料不足。")
 
         st.markdown("---")
         
@@ -193,11 +238,11 @@ with tab1:
             fig.add_trace(go.Scatter(x=df.index, y=df['SMA_20'], line=dict(color='blue', width=1), name='月線'), row=1, col=1)
             fig.update_layout(height=500, xaxis_rangeslider_visible=False, showlegend=False)
             st.plotly_chart(fig, use_container_width=True)
-            
+
         with col_fund:
             st.markdown("### 💰 財報趨勢")
-            fin = info['financial_data']
-            if len(fin['years']) > 0:
+            fin = info.get('financial_data')
+            if fin and len(fin['years']) > 0:
                 fig_fin = go.Figure()
                 fig_fin.add_trace(go.Bar(x=fin['years'], y=fin['revenues'], name='營收'))
                 fig_fin.add_trace(go.Bar(x=fin['years'], y=fin['earnings'], name='淨利'))
@@ -212,14 +257,10 @@ with tab1:
             for news in news_list:
                 st.write(f"- [{news.title}]({news.link})")
 
-    else:
-        st.error("⚠️ 無法讀取資料，請確認股票代號是否正確 (例如 2330 或 2330.TW)。")
-
-# --- TAB 2: AI 修正版 ---
+# --- TAB 2 ---
 with tab2:
-    # 這裡加入更嚴格的檢查
-    if df is not None and info is not None:
-        st.subheader(f"🤖 AI 預測實驗室：{info['name']}")
+    if df is not None:
+        st.subheader(f"🤖 AI 預測實驗室")
         if st.button("🚀 執行 AI 運算"):
             with st.spinner("AI 運算中..."):
                 pred, acc = train_and_predict(df)
@@ -232,37 +273,33 @@ with tab2:
                 else:
                     st.error("資料不足，無法預測")
     else:
-        st.warning("請先在側邊欄輸入正確的股票代號。")
+        st.warning("無資料可供預測")
 
 # --- TAB 3 ---
 with tab3:
     st.subheader("🎯 智慧選股雷達")
-    target_stocks = ['2330', '2317', '2454', '2308', '2603', '2609', '2881', '2882', '2412', '1605']
-    if st.button("📡 掃描熱門股"):
+    target_stocks = ['2330', '2317', '2454', '2308', '2603']
+    if st.button("📡 快速掃描 (測試)"):
         results = []
         bar = st.progress(0)
         for i, code in enumerate(target_stocks):
             bar.progress((i+1)/len(target_stocks))
             try:
-                d = yf.download(code+".TW", period="1mo", progress=False)
+                # 這裡也套用 session 偽裝
+                session = requests.Session()
+                session.headers.update({'User-Agent': 'Mozilla/5.0'})
+                d = yf.download(code+".TW", period="1mo", progress=False, session=session)
+                
                 if d.empty: continue
                 if isinstance(d.columns, pd.MultiIndex): d.columns = d.columns.get_level_values(0)
                 
-                sma5 = ta.sma(d['Close'], 5).iloc[-1]
-                sma20 = ta.sma(d['Close'], 20).iloc[-1]
-                prev_sma5 = ta.sma(d['Close'], 5).iloc[-2]
-                prev_sma20 = ta.sma(d['Close'], 20).iloc[-2]
+                # 簡單計算
                 rsi = ta.rsi(d['Close'], 14).iloc[-1]
-                
-                sig = ""
-                if prev_sma5 <= prev_sma20 and sma5 > sma20: sig = "🔥 黃金交叉"
-                elif rsi < 25: sig = "💎 RSI超賣"
-                
-                if sig:
-                    results.append({"代號": code, "現價": f"{d['Close'].iloc[-1]:.2f}", "訊號": sig})
+                results.append({"代號": code, "現價": round(d['Close'].iloc[-1], 2), "RSI": round(rsi, 2)})
             except: continue
         
         if results:
             st.dataframe(pd.DataFrame(results), use_container_width=True)
         else:
-            st.info("無符合條件股票")
+            st.warning("掃描失敗，可能是連線被阻擋。")
+            
