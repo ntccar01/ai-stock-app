@@ -1,11 +1,11 @@
 streamlit
-yfinance>=0.2.40
-pandas>=2.0.0
+yfinance
+pandas
 pandas_ta
 plotly
 twstock
 feedparser
 scikit-learn
-lxml
+xgboost
 requests
 FinMind
