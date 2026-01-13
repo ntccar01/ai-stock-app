@@ -8,12 +8,12 @@ import twstock
 import feedparser
 import urllib.parse
 from datetime import datetime, timedelta
-from sklearn.ensemble import RandomForestRegressor
 import requests
 from FinMind.data import DataLoader
+import xgboost as xgb  # 引入 XGBoost
 
 # --- 1. 網頁設定 ---
-st.set_page_config(page_title="AI 股市操盤手 V7.1 上櫃支援版", layout="wide")
+st.set_page_config(page_title="AI 股市操盤手 Pro (XGBoost版)", layout="wide")
 
 st.markdown("""
 <style>
@@ -65,7 +65,7 @@ def get_data(ticker_symbol, start_date):
         df = dl.taiwan_stock_daily(stock_id=stock_id, start_date=start_str)
         
         if df.empty:
-            print("FinMind empty, trying Yahoo backup...")
+            # print("FinMind empty, trying Yahoo backup...")
             return get_data_yahoo_backup(ticker_symbol, start_date)
 
         df = df.rename(columns={
@@ -79,6 +79,7 @@ def get_data(ticker_symbol, start_date):
         cols = ['Open', 'High', 'Low', 'Close', 'Volume']
         df[cols] = df[cols].apply(pd.to_numeric, errors='coerce')
 
+        # 技術指標計算
         df['SMA_5'] = ta.sma(df['Close'], length=5)
         df['SMA_20'] = ta.sma(df['Close'], length=20)
         df['SMA_60'] = ta.sma(df['Close'], length=60)
@@ -126,25 +127,75 @@ def get_news(stock_name):
     except:
         return []
 
+# --- 升級後的 AI 預測核心 (XGBoost) ---
 def train_and_predict(df):
     try:
         df_ml = df.copy()
+
+        # 1. 特徵工程優化 (Feature Engineering)
+        # 加入 "昨天" 的數據 (Lag Features)，讓模型有時間觀念
+        df_ml['Close_Lag1'] = df_ml['Close'].shift(1)   # 昨收
+        df_ml['Volume_Lag1'] = df_ml['Volume'].shift(1) # 昨量
+        df_ml['RSI_Lag1'] = df_ml['RSI'].shift(1)       # 昨 RSI
+        
+        # 乖離率 (Bias): 目前價格與 20 日線的距離百分比
+        df_ml['Bias_20'] = (df_ml['Close'] - df_ml['SMA_20']) / df_ml['SMA_20']
+
+        # 設定預測目標：明天的收盤價
         df_ml['Target'] = df_ml['Close'].shift(-1)
-        features = ['Open', 'High', 'Low', 'Close', 'Volume', 'SMA_5', 'SMA_20', 'RSI', 'Momentum']
+
+        # 定義特徵欄位
+        features = [
+            'Open', 'High', 'Low', 'Close', 'Volume', 
+            'SMA_5', 'SMA_20', 'RSI', 'Momentum',
+            'Close_Lag1', 'Volume_Lag1', 'RSI_Lag1', 'Bias_20'
+        ]
+
+        # 移除空值
         data = df_ml.dropna()
         X = data[features]
         y = data['Target']
-        if len(X) < 10: return 0, 0
+
+        # 資料過少不訓練
+        if len(X) < 30: return 0, 0
+
+        # 切分訓練集與測試集 (90% 訓練, 10% 驗證)
         split = int(len(X) * 0.9)
-        model = RandomForestRegressor(n_estimators=100, random_state=42)
-        model.fit(X.iloc[:split], y.iloc[:split])
-        score = model.score(X.iloc[split:], y.iloc[split:])
-        pred = model.predict(df_ml.iloc[[-1]][features])[0]
+        X_train, X_test = X.iloc[:split], X.iloc[split:]
+        y_train, y_test = y.iloc[:split], y.iloc[split:]
+
+        # 2. 建立 XGBoost 模型
+        model = xgb.XGBRegressor(
+            n_estimators=1000,
+            learning_rate=0.01,
+            max_depth=5,
+            early_stopping_rounds=50,
+            objective='reg:squarederror',
+            n_jobs=-1,
+            random_state=42
+        )
+
+        # 3. 訓練模型
+        model.fit(
+            X_train, y_train,
+            eval_set=[(X_test, y_test)],
+            verbose=False
+        )
+
+        # 計算準確度 (R2 Score)
+        score = model.score(X_test, y_test)
+
+        # 4. 進行預測
+        last_row = df_ml.iloc[[-1]][features]
+        pred = model.predict(last_row)[0]
+
         return pred, score
-    except:
+
+    except Exception as e:
+        print(f"AI Error: {e}")
         return 0, 0
 
-# --- 3. 介面邏輯 (已升級：支援上市上櫃判斷) ---
+# --- 3. 介面邏輯 ---
 st.sidebar.header("🔍 設定與搜尋")
 ticker_input = st.sidebar.text_input("輸入代號", value="2330")
 time_range = st.sidebar.radio("區間", ["6個月", "1年", "3年"], index=1)
@@ -177,7 +228,7 @@ df = get_data(ticker_search, start_date)
 info = get_stock_info(ticker_display, ticker_search)
 market_df = get_market_data(start_date)
 
-tab1, tab2, tab3 = st.tabs(["📊 綜合分析與績效", "🧠 AI 預測模型", "🎯 智慧選股掃描"])
+tab1, tab2, tab3 = st.tabs(["📊 綜合分析與績效", "🧠 AI 預測模型 (XGBoost)", "🎯 智慧選股掃描"])
 
 # --- TAB 1 ---
 with tab1:
@@ -230,16 +281,28 @@ with tab1:
 # --- TAB 2 ---
 with tab2:
     if df is not None:
-        st.subheader(f"🤖 AI 預測實驗室")
+        st.subheader(f"🤖 AI 預測實驗室 (Powered by XGBoost)")
+        st.markdown("""
+        > **模型說明：** > 本模型使用 **XGBoost** 演算法，已加入滯後特徵 (Lag Features) 與乖離率 (Bias) 因子。
+        > 預測結果僅供學術研究，**請勿作為唯一投資依據**。
+        """)
+        
         if st.button("🚀 執行 AI 運算"):
-            with st.spinner("AI 運算中..."):
+            with st.spinner("正在訓練 XGBoost 模型並進行推論..."):
                 pred, acc = train_and_predict(df)
                 if pred > 0:
                     last = df['Close'].iloc[-1]
                     chg = (pred - last) / last * 100
+                    
+                    st.divider()
                     c1, c2 = st.columns(2)
-                    c1.metric("AI 預測價格", f"{pred:.2f}", f"{chg:.2f}%")
-                    c2.metric("模型信心度", f"{acc*100:.1f}%")
+                    c1.metric("AI 預測下個交易日價格", f"{pred:.2f}", f"{chg:.2f}%")
+                    c2.metric("模型回測信心度 (R2)", f"{acc*100:.1f}%")
+                    
+                    if acc < 0:
+                        st.warning("⚠️ 警告：目前模型信心度為負值，表示最近股價波動極不規律，預測參考價值低。")
+                else:
+                    st.error("資料不足，無法訓練。")
     else:
         st.warning("無資料")
 
@@ -247,7 +310,7 @@ with tab2:
 with tab3:
     st.subheader("🎯 智慧選股雷達 (含上櫃)")
     # 這裡加入一些上櫃熱門股範例：8069(元太), 3293(鈊象)
-    target_stocks = ['2330', '2317', '2454', '8069', '3293']
+    target_stocks = ['2330', '2317', '2454', '8069', '3293', '3008', '2603']
     if st.button("📡 快速掃描"):
         results = []
         bar = st.progress(0)
@@ -258,13 +321,21 @@ with tab3:
         for i, code in enumerate(target_stocks):
             bar.progress((i+1)/len(target_stocks))
             try:
-                d = dl.taiwan_stock_daily(stock_id=code, start_date=start_scan)
-                if d.empty: continue
+                # 簡單判斷上市上櫃以抓取資料 (Yahoo fallback 用)
+                scan_suffix = ".TW"
+                if code in twstock.codes and twstock.codes[code].type == "上櫃":
+                    scan_suffix = ".TWO"
                 
-                close = d['close'].iloc[-1]
-                rsi = ta.rsi(pd.Series(d['close']), 14).iloc[-1]
+                # 這裡為了速度先嘗試 Yahoo，因為 FinMind 連續抓取容易被擋
+                d = yf.download(code + scan_suffix, start=start_scan, progress=False)
+                if isinstance(d.columns, pd.MultiIndex): d.columns = d.columns.get_level_values(0)
                 
-                # 判斷上市上櫃顯示名稱
+                if d.empty or len(d) < 14: continue
+                
+                close = d['Close'].iloc[-1]
+                rsi = ta.rsi(d['Close'], 14).iloc[-1]
+                
+                # 取得名稱
                 name = code
                 if code in twstock.codes:
                     name = twstock.codes[code].name
@@ -272,7 +343,7 @@ with tab3:
                 results.append({
                     "名稱": name,
                     "代號": code,
-                    "現價": close,
+                    "現價": f"{close:.1f}",
                     "RSI": round(rsi, 2)
                 })
             except: continue
